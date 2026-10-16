@@ -422,6 +422,11 @@ plx_base::dynlib! {
     ) -> c_int;
     fn avsubtitle_free(sub: *mut AVSubtitle);
     fn avcodec_free_context(ctx: *mut *mut AVCodecContext);
+    // FORK (RichiL10): audio decode for the PCM lane (`ff_pcm.rs`) — the send/receive API, in
+    // libavcodec since 3.1 and the only audio decode API FFmpeg 9.0 has.
+    fn avcodec_send_packet(ctx: *mut AVCodecContext, pkt: *const AVPacket) -> c_int;
+    fn avcodec_receive_frame(ctx: *mut AVCodecContext, frame: *mut c_void) -> c_int;
+    fn avcodec_flush_buffers(ctx: *mut AVCodecContext);
     // Scratch AVCodecParameters for `sub_canvas` — library-allocated so its true size (136 on
     // this build) is never our problem, and `from_context` starts by av_freep-ing par->extradata.
     // Both PRESENT on the device's own libavcodec.so.57.89.100 (`tools/abi-probe.sh has
@@ -455,9 +460,14 @@ plx_base::dynlib! {
     // MPEG1 encode input frames + option/pixfmt helpers (venc section)
     fn av_frame_alloc() -> *mut c_void;
     fn av_frame_free(frame: *mut *mut c_void);
+    // FORK (RichiL10): the PCM lane reuses one frame per decoded packet.
+    fn av_frame_unref(frame: *mut c_void);
     fn av_frame_get_buffer(frame: *mut c_void, align: c_int) -> c_int;
     fn av_frame_make_writable(frame: *mut c_void) -> c_int;
     fn av_opt_set(obj: *mut c_void, name: *const c_char, val: *const c_char, search_flags: c_int) -> c_int;
+    // FORK (RichiL10): channel roles and the 5.1(side) layout for the AC3 encode lane (`ff_enc.rs`).
+    fn av_channel_layout_channel_from_index(layout: *const AVChannelLayout, idx: c_uint) -> c_int;
+    fn av_channel_layout_from_string(layout: *mut AVChannelLayout, s: *const c_char) -> c_int;
     fn av_get_pix_fmt(name: *const c_char) -> c_int;
     // Container tags. Borrowed, never freed: the entry belongs to the dictionary, which belongs to
     // the AVStream, which `avformat_close_input` frees — so every read must copy before the close.
@@ -663,7 +673,9 @@ unsafe fn audio_stream_matching(fmt: *mut AVFormatContext, want: &str) -> Option
         let cp = stream_codecpar(*streams.add(i as usize));
         if (*cp).codec_type == AVMEDIA_TYPE_AUDIO {
             let name = std::ffi::CStr::from_ptr(avcodec_get_name((*cp).codec_id)).to_string_lossy();
-            if name.eq_ignore_ascii_case(want) {
+            // FORK (RichiL10): PMS says `pcm` for every LPCM flavour FFmpeg names `pcm_s24le` etc.
+            let pcm_family = want.eq_ignore_ascii_case("pcm") && name.starts_with("pcm_");
+            if name.eq_ignore_ascii_case(want) || pcm_family {
                 return Some(i as c_int);
             }
         }
@@ -1667,6 +1679,17 @@ mod acquisition;
 mod subs;
 #[path = "ff_subside.rs"]
 pub(crate) mod subside;
+// FORK (RichiL10): the PCM audio lane (FLAC decoded in-app, native PCM converted).
+#[path = "ff_pcm.rs"]
+mod pcm;
+pub use pcm::{declare as declare_pcm, PcmSpec, PcmWidth};
+use pcm::PcmLane;
+// FORK (RichiL10): the AC3 encode lane (FLAC/PCM above the PCM lane, TrueHD/MLP: decoded,
+// folded to 5.1 and encoded to AC3 640 kbps in-app).
+#[path = "ff_enc.rs"]
+mod enc;
+pub use enc::{declare as declare_enc, EncSpec};
+use enc::EncLane;
 use subs::{SubKind, SubTracks};
 #[cfg(test)]
 use subs::{decode_bitmap_cue, open_sub_decoder, sub_kind};
@@ -2770,6 +2793,15 @@ static SEI_STRIPPED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64
 static EL_DROPPED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static RPU_REWRITTEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static RPU_FAILED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+// FORK (RichiL10): one-time evidence per demux run (re-armed where the conversion is armed) that
+// the enhancement layer is really being dropped, one flag per spelling it can arrive in.
+static EL_UNSPEC63_LOGGED: AtomicBool = AtomicBool::new(false);
+static EL_LAYER_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// HEVC `UNSPEC63`: the NAL type a single-track Dolby Vision dual layer (a UHD Blu-ray remux)
+/// wraps each enhancement-layer NAL in. It is what `dovi_tool demux` splits the enhancement layer
+/// out by, and what `dovi_tool convert --discard` drops.
+const HEVC_NAL_DV_EL: u8 = 63;
 
 /// `nuh_layer_id` of an HEVC NAL (`nal` starts at the 2-byte NAL header): bit 0 of byte 0 is the
 /// high bit, the top five bits of byte 1 the rest. A single-layer stream is layer 0 throughout; a
@@ -2781,6 +2813,21 @@ fn hevc_layer_id(nal: &[u8]) -> u8 {
         return 0;
     }
     ((nal[0] & 1) << 5) | (nal[1] >> 3)
+}
+
+/// True if this HEVC NAL is wrapped in `UNSPEC63`, the single-track dual-layer spelling of a
+/// Dolby Vision enhancement-layer NAL. `nal` starts at the 2-byte NAL header.
+fn is_dv_el_unspec63(nal: &[u8]) -> bool {
+    nal.len() >= 2 && ((nal[0] >> 1) & 0x3f) == HEVC_NAL_DV_EL
+}
+
+/// True if this HEVC NAL belongs to a Dolby Vision enhancement layer: wrapped in `UNSPEC63`, as a
+/// single-track dual layer stores it, or carried in a layer above the base (`nuh_layer_id > 0`),
+/// which a single-layer decoder never decodes either. `nal` starts at the 2-byte NAL header.
+// FORK (RichiL10): ported from upstream-proposal b228a516; the fork used to test only the layer id,
+// so every UHD Blu-ray remux (EL in UNSPEC63 on layer 0) still fed its EL to the decoder.
+fn is_dv_enhancement_layer(nal: &[u8]) -> bool {
+    nal.len() >= 2 && (is_dv_el_unspec63(nal) || hevc_layer_id(nal) > 0)
 }
 
 /// Rewrite a Dolby Vision RPU NAL (HEVC UNSPEC62; `nal` = 2-byte header + payload, emulation-
@@ -2853,7 +2900,8 @@ fn nal_end(i: usize, nl: usize, size: usize) -> Option<usize> {
 /// types 16-23). Returns true if it is a keyframe. Mirrors mkv_handle_block.
 ///
 /// `dv_p7` — the stream is a dual-layer Dolby Vision **Profile 7** being converted to 8.1 on the
-/// way to the pipeline: every enhancement-layer NAL (`nuh_layer_id` > 0) is dropped and every
+/// way to the pipeline: every enhancement-layer NAL ([`is_dv_enhancement_layer`]: the `UNSPEC63`
+/// wrapper or `nuh_layer_id` > 0) is dropped and every
 /// RPU NAL (type 62) is rewritten by [`rewrite_rpu_p7_to_p81`], so what leaves here is the
 /// single-layer stream the Load payload declares (`DolbyHdrInfo profileId 8`).
 unsafe fn packet_to_annexb(
@@ -2911,9 +2959,22 @@ unsafe fn packet_to_annexb(
         };
         let nal = &d[i..end];
         if is_hevc && dv_p7 {
-            // Profile 7 -> 8.1, in-app: the enhancement layer never reaches the pipeline, and each
+            // Profile 7 -> 8.1, in-app: the enhancement layer (UNSPEC63-wrapped or layer > 0) never
+            // reaches the pipeline, and each
             // RPU is rewritten so the dynamic metadata describes the single layer that does.
-            if hevc_layer_id(nal) > 0 {
+            if is_dv_enhancement_layer(nal) {
+                // FORK (RichiL10): the package / on-TV evidence, once per demux run and spelling.
+                if is_dv_el_unspec63(nal) {
+                    if !EL_UNSPEC63_LOGGED.swap(true, Ordering::Relaxed) {
+                        crate::player::log(
+                            "ff: Dolby Vision P7 enhancement layer dropped (UNSPEC63)",
+                        );
+                    }
+                } else if !EL_LAYER_LOGGED.swap(true, Ordering::Relaxed) {
+                    crate::player::log(
+                        "ff: Dolby Vision P7 enhancement layer dropped (nuh_layer_id > 0)",
+                    );
+                }
                 let n = EL_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 3 || n % 5000 == 0 {
                     crate::player::log(&format!(
@@ -2965,6 +3026,20 @@ unsafe fn packet_to_annexb(
 }
 
 static DIAG_FIRST: AtomicBool = AtomicBool::new(true);
+
+/// Does one Annex-B HEVC access unit carry a Dolby Vision RPU (unspecified NAL type 62)?
+fn annexb_has_hevc_rpu(data: &[u8]) -> bool {
+    let mut cursor = 0;
+    while let Some((start, prefix)) = annexb_start(data, cursor) {
+        let payload = start + prefix;
+        let end = annexb_start(data, payload).map_or(data.len(), |(next, _)| next);
+        if data.get(payload..end).is_some_and(|nal| nal.len() >= 2 && ((nal[0] >> 1) & 0x3f) == 62) {
+            return true;
+        }
+        cursor = payload;
+    }
+    false
+}
 
 /// Extract one DTS core access unit, dropping the DTS-HD extension substream. Matroska and
 /// MOV demux return the complete packet; our bundled FFmpeg 9.0 has neither the dca parser nor
@@ -7931,6 +8006,34 @@ pub fn demux(
                 if dts_audio {
                     crate::player::log("ff: DTS core extraction on (DTS-HD extensions discarded)");
                 }
+                // FORK (RichiL10): FLAC and native PCM go through the PCM lane in the format the
+                // Load declared (`ff_pcm.rs`); Opus is fed as-is with its declared opusInfo.
+                let mut pcm_lane: Option<PcmLane> = None;
+                // FORK (RichiL10): ...and the tracks the Load declared as encode-lane AC3 go
+                // through the AC3 encode lane instead (`ff_enc.rs`).
+                let mut enc_lane: Option<EncLane> = None;
+                if ai >= 0 {
+                    let acp = stream_codecpar(*streams.add(ai as usize));
+                    let opened = match enc::declared() {
+                        Some(spec) => EncLane::open(acp, spec).map(|lane| enc_lane = Some(lane)),
+                        None => PcmLane::open(acp, pcm::declared()).map(|lane| pcm_lane = lane),
+                    };
+                    if let Err(why) = opened {
+                        let which = if enc::declared().is_some() { "encode" } else { "PCM" };
+                        crate::player::log(&format!("ff: {which} lane refused: {why}; refusing audio feed"));
+                        SHARED.demux_failed.store(true, Ordering::Release);
+                        avformat_close_input(&mut fmt);
+                        free_avio(avio);
+                        break;
+                    }
+                    if std::ffi::CStr::from_ptr(avcodec_get_name((*acp).codec_id)).to_bytes() == b"opus" {
+                        crate::player::log(&format!(
+                            "ff: audio lane OPUS native {}ch (OpusHead {} bytes)",
+                            (*acp).ch_layout.nb_channels,
+                            (*acp).extradata_size
+                        ));
+                    }
+                }
                 if let Some((fi, ch)) = aac_adts {
                     crate::player::log(&format!(
                         "ff: AAC → ADTS reframing on (freq_idx={fi} ch={ch})"
@@ -8018,20 +8121,27 @@ pub fn demux(
                 // build the AU from the codecpar extradata; libavformat still owns demux + seeking.
                 let is_hevc = (*vcp).codec_id == AV_CODEC_ID_HEVC;
                 // Dolby Vision Profile 7 (dual-layer, cross-compatible base layer) is converted to
-                // Profile 8.1 while feeding — `packet_to_annexb` drops the enhancement layer and
-                // rewrites the RPUs — so the pipeline is handed the single-layer shape the Load
-                // payload declares (`DolbyHdrInfo profileId 8`, see
-                // `plx_data::metadata::Dovi::converts_to_p81`).
-                let dv_p7 = is_hevc
-                    && dovi_conf(vcp).is_some_and(|d| {
-                        d.dv_profile == 7
-                            && d.el_present_flag != 0
-                            && d.dv_bl_signal_compatibility_id != 0
-                    });
+                // Profile 8.1 while feeding.  PMS's Matroska remux can preserve the HEVC RPU NALs
+                // yet omit the DOVI configuration record, so retain the route's frozen source
+                // decision as a narrow fallback for that observed server shape.
+                let container_p7 = dovi_conf(vcp).is_some_and(|d| {
+                    d.dv_profile == 7
+                        && d.el_present_flag != 0
+                        && d.dv_bl_signal_compatibility_id != 0
+                });
+                // FORK (RichiL10): a video-copy remux has the source bitstream even when its
+                // Matroska codec parameters lost the DOVI record.
+                let route_p7 = dovi_conf(vcp).is_none()
+                    && plx_base::forkknobs::is("remux_dv", "on", "on")
+                    && crate::route::frozen_route_dovi().converts_to_p81();
+                let dv_p7 = is_hevc && (container_p7 || route_p7);
                 if dv_p7 {
                     crate::player::log(
                         "ff: Dolby Vision P7 -> P8.1 conversion armed (EL dropped, RPUs rewritten)",
                     );
+                    // FORK (RichiL10): re-arm the one-time EL-drop evidence for this run.
+                    EL_UNSPEC63_LOGGED.store(false, Ordering::Relaxed);
+                    EL_LAYER_LOGGED.store(false, Ordering::Relaxed);
                 }
                 let (param_blob, nal_len_size) = parse_extradata(
                     (*vcp).extradata,
@@ -8055,6 +8165,10 @@ pub fn demux(
                 }
 
                 let mut anchor_taken = false;
+                // FORK (RichiL10): a declared DV route without RPU NALs is almost always a PMS
+                // remux metadata loss worth diagnosing on-device.
+                let mut dv_aus_checked = 0u8;
+                let mut dv_rpu_seen = false;
                 // INNER read loop
                 loop {
                     // Direct-play seek (and the armed resume, which is just a seek published before
@@ -8105,6 +8219,13 @@ pub fn demux(
                         // Fence completed renders from the old position before new packets arrive.
                         crate::player::ass_source::seek(ass_generation);
                         let sr = av_seek_frame(fmt, vi, ts, AVSEEK_FLAG_BACKWARD);
+                        // FORK (RichiL10): no decoder state may survive the discontinuity.
+                        if let Some(lane) = pcm_lane.as_mut() {
+                            lane.flush();
+                        }
+                        if let Some(lane) = enc_lane.as_mut() {
+                            lane.flush();
+                        }
                         crate::player::log(&format!(
                             "ff: seek {}s rv={sr}",
                             seek_ns / 1_000_000_000
@@ -8137,6 +8258,13 @@ pub fn demux(
                             &mut aubuf,
                         );
                         let pts = pts_ns(pkt, vst);
+                        if is_hevc && crate::route::frozen_route_declares_dv() && dv_aus_checked < 48 {
+                            dv_aus_checked += 1;
+                            dv_rpu_seen |= annexb_has_hevc_rpu(&aubuf);
+                            if dv_aus_checked == 48 && !dv_rpu_seen {
+                                crate::player::log("ff: Dolby Vision declared but no RPU NALs seen in first 48 video AUs");
+                            }
+                        }
                         if DIAG_FIRST.swap(false, Ordering::Relaxed) {
                             let n = aubuf.len().min(40);
                             let head: String = aubuf[..n]
@@ -8184,7 +8312,7 @@ pub fn demux(
                                 2,
                                 || state.drain_wire(),
                             )
-                        } else if dts_audio {
+                        } else if dts_audio && enc_lane.is_none() {
                             let raw = std::slice::from_raw_parts((*pkt).data, (*pkt).size.max(0) as usize);
                             let Some(core) = dts_core_packet(raw) else {
                                 crate::player::log("ff: DTS packet has no complete supported core; refusing audio feed");
@@ -8197,6 +8325,30 @@ pub fn demux(
                                 aqa_p, core.as_ptr(), core.len() as c_int, pts, 1, 2,
                                 || state.drain_wire(),
                             )
+                        } else if let Some(lane) = enc_lane.as_mut() {
+                            // FORK (RichiL10): zero or more AC3 frames, each with its own pts.
+                            let mut pushed = 0;
+                            for (at, ac3) in lane.convert(pkt, pts_ns_opt(pkt, ast)) {
+                                pushed = crate::aq::aq_push_with_drain(
+                                    aqa_p, ac3.as_ptr(), ac3.len() as c_int, *at, 1, 2,
+                                    || state.drain_wire(),
+                                );
+                                if pushed != 0 {
+                                    break;
+                                }
+                            }
+                            pushed
+                        } else if let Some(lane) = pcm_lane.as_mut() {
+                            // FORK (RichiL10): decoded/converted PCM, one buffer per packet.
+                            let pcm = lane.convert(pkt);
+                            if pcm.is_empty() {
+                                0
+                            } else {
+                                crate::aq::aq_push_with_drain(
+                                    aqa_p, pcm.as_ptr(), pcm.len() as c_int, pts, 1, 2,
+                                    || state.drain_wire(),
+                                )
+                            }
                         } else {
                             crate::aq::aq_push_with_drain(
                                 aqa_p,
